@@ -7,7 +7,7 @@ import io from 'socket.io-client';
 import { supabase } from './supabaseClient';
 import { 
   FaUserPlus, FaDesktop, FaFingerprint, FaCog,
-  FaArrowLeft, FaCamera, FaCheckCircle, FaPowerOff, FaWifi, FaVideoSlash, FaSignOutAlt
+  FaArrowLeft, FaCamera, FaCheckCircle, FaPowerOff, FaWifi, FaVideoSlash, FaSignOutAlt, FaIdCard
 } from 'react-icons/fa';
 import './styles.css';
 
@@ -28,6 +28,7 @@ function App() {
 
   const [deviceKey, setDeviceKey] = useState('');
   const [deviceId, setDeviceId] = useState(null);
+  const [deviceName, setDeviceName] = useState(null); // NEW: Store Device Name
   
   const [students, setStudents] = useState([]);
   const [schedules, setSchedules] = useState([]);
@@ -96,7 +97,8 @@ function App() {
       if (std) setStudents(std);
       if (sch) setSchedules(sch);
 
-      if (std && std.length > 0) {
+      // Only train if camera is enabled and we have students with images
+      if (cameraEnabled && std && std.length > 0) {
         const labeledDescriptors = await Promise.all(
           std.map(async (student) => {
             if (!student.face_image_url) return null;
@@ -126,7 +128,6 @@ function App() {
     socket.emit('change-port', newPort);
   };
 
-  // Exit the entire application (Requires Admin)
   const handleAppExit = async () => {
     const { value: formValues } = await Swal.fire({
       title: 'Admin Authorization',
@@ -157,7 +158,7 @@ function App() {
         setLoadingText('');
         if (response.ok) {
            if(deviceId) await supabase.from('devices').update({ status: 'offline' }).eq('id', deviceId);
-           window.close(); // Try to close window
+           window.close();
            Swal.fire({ icon: 'success', title: 'Application Ended', text: 'You can close this window.' });
         } else {
            Swal.fire('Access Denied', 'Invalid Admin Credentials', 'error');
@@ -184,19 +185,27 @@ function App() {
   // --- 5. KIOSK LOGIC ---
   const loginKiosk = async () => {
     if (!deviceKey) return Swal.fire('Error', 'Enter a key', 'error');
-    const { data, error } = await supabase.from('devices').select('id, device_name').eq('connection_key', deviceKey).single();
+    
+    // UPDATED: Fetch Device Name and Camera Config
+    const { data, error } = await supabase
+      .from('devices')
+      .select('id, device_name, camera_enabled') 
+      .eq('connection_key', deviceKey)
+      .single();
 
     if (error || !data) {
       Swal.fire('Access Denied', 'Invalid Key', 'error');
     } else {
       setDeviceId(data.id);
+      setDeviceName(data.device_name); // Set Name
+      setCameraEnabled(data.camera_enabled ?? true); // Set Camera/Face Rec status
+      
       await supabase.from('devices').update({ status: 'online' }).eq('id', data.id);
       await syncDataAndTrain();
       setView('idle');
     }
   };
 
-  // Exit Kiosk Mode (Go to Menu, Set Offline)
   const handleKioskExit = async () => {
     const { value: key } = await Swal.fire({
       title: 'Exit Kiosk Mode?',
@@ -218,6 +227,7 @@ function App() {
         await supabase.from('devices').update({ status: 'offline' }).eq('id', deviceId);
         setView('menu');
         setDeviceId(null);
+        setDeviceName(null); // Clear Name
         setDeviceKey('');
         Swal.fire({ icon: 'success', title: 'Offline', timer: 1500, showConfirmButton: false });
       } else {
@@ -234,7 +244,6 @@ function App() {
     idleTimeoutRef.current = setTimeout(() => setView('idle'), 20000); 
   };
 
-  // Attendance Processing
   const processAttendance = async (uid) => {
     if (idleTimeoutRef.current) clearTimeout(idleTimeoutRef.current);
     idleTimeoutRef.current = setTimeout(() => setView('idle'), 20000);
@@ -267,7 +276,6 @@ function App() {
     setView('idle');
   };
 
-  // Register Scan
   const handleRegistrationScan = async (uid) => {
     const { value: studentId } = await Swal.fire({
       title: 'Card Detected',
@@ -356,7 +364,7 @@ function App() {
             </div>
 
             <div className="input-group toggle-row">
-              <label className="input-label" style={{marginBottom:0}}>Camera</label>
+              <label className="input-label" style={{marginBottom:0}}>Force Camera Enable</label>
               <label className="switch">
                 <input type="checkbox" checked={cameraEnabled} onChange={e => setCameraEnabled(e.target.checked)} />
                 <span className="slider"></span>
@@ -382,7 +390,12 @@ function App() {
               <motion.div animate={{ y: [0, 15, 0] }} transition={{ repeat: Infinity, duration: 2 }} className="fingerprint">
                 <FaFingerprint />
               </motion.div>
-              <div className="port-info">Port: {selectedPort}</div>
+              {/* UPDATED FOOTER INFO */}
+              <div className="footer-info">
+                 <span className="device-name">{deviceName || 'Unknown Device'}</span>
+                 <span className="separator">|</span>
+                 <span className="port-name">Port: {selectedPort}</span>
+              </div>
             </div>
           </motion.div>
         )}
@@ -409,9 +422,23 @@ function App() {
                   <canvas ref={canvasRef} className="canvas-overlay" />
                 </>
               ) : (
-                <div className="camera-off"><FaVideoSlash size={50}/><p>Camera Disabled</p></div>
+                /* NEW PLACEHOLDER WHEN CAMERA IS DISABLED */
+                <div className="camera-off">
+                  <FaIdCard size={80} className="mb-4 text-orange animate-bounce" />
+                  <h3 className="text-2xl font-bold text-white mb-2">Face Recognition Disabled</h3>
+                  <p className="text-white/70 text-center max-w-md px-4">
+                    You can log in using only RFID since the teacher or admin allowed it.
+                    <br/><br/>
+                    <strong>Please Tap Your Card</strong>
+                  </p>
+                </div>
               )}
-              <div className="overlay-message"><div className="badge"><FaCamera/> Tap RFID Card</div></div>
+              
+              {cameraEnabled && (
+                <div className="overlay-message">
+                  <div className="badge"><FaCamera/> Tap RFID Card</div>
+                </div>
+              )}
             </div>
             <button className="btn btn-secondary mt-4" onClick={() => setView('idle')}>Cancel</button>
           </motion.div>
