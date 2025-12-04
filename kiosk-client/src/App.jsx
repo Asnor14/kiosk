@@ -6,8 +6,8 @@ import Swal from 'sweetalert2';
 import io from 'socket.io-client';
 import { supabase } from './supabaseClient';
 import { 
-  FaUserPlus, FaDesktop, FaSignOutAlt, FaFingerprint, 
-  FaArrowLeft, FaCamera, FaIdCard, FaCheckCircle, FaUserShield 
+  FaUserPlus, FaDesktop, FaFingerprint, 
+  FaArrowLeft, FaCamera, FaIdCard, FaCheckCircle, FaUserShield, FaWifi 
 } from 'react-icons/fa';
 import './styles.css';
 
@@ -16,7 +16,7 @@ const socket = io('http://localhost:4000');
 
 function App() {
   const [view, setView] = useState('menu'); 
-  // views: menu, login, register_face, register_scan, idle, attendance
+  // views: menu, login, register_scan, idle, attendance
   
   const [deviceKey, setDeviceKey] = useState('');
   const [deviceId, setDeviceId] = useState(null);
@@ -26,8 +26,6 @@ function App() {
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [faceMatcher, setFaceMatcher] = useState(null);
   const [loadingText, setLoadingText] = useState('');
-  
-  const [tempRegStudent, setTempRegStudent] = useState(null);
 
   const webcamRef = useRef(null);
   const canvasRef = useRef(null);
@@ -60,6 +58,7 @@ function App() {
       setModelsLoaded(true);
       console.log("✅ FaceAPI Models Loaded");
     } catch (e) {
+      console.error(e);
       Swal.fire('Error', 'Failed to load AI models. Check public/models folder.', 'error');
     }
   };
@@ -98,10 +97,11 @@ function App() {
 
   // --- 3. RFID LOGIC ROUTER ---
   const handleRfidScan = (uid) => {
+    // We use getAttribute to avoid stale state in the socket listener closure
     const currentView = document.getElementById('app-view-state')?.getAttribute('data-view');
 
     if (currentView === 'register_scan') {
-      completeRegistration(uid);
+      handleRegistrationScan(uid);
     } else if (currentView === 'attendance') {
       processAttendance(uid);
     }
@@ -146,11 +146,80 @@ function App() {
 
   // --- 5. FLOW FUNCTIONS ---
 
-  const startRegister = async () => {
-    setLoadingText('Preparing Registration...');
-    await syncDataAndTrain();
-    setLoadingText('');
-    setView('register_face');
+  const startRegister = () => {
+    // Directly go to Scan RFID mode (Skipping face scan)
+    setView('register_scan');
+  };
+
+  const handleRegistrationScan = async (uid) => {
+    // 1. Popup to ask for Student ID
+    const { value: studentId } = await Swal.fire({
+      title: 'Card Detected!',
+      html: `
+        <p>UID: <strong>${uid}</strong></p>
+        <p class="mt-2">Please enter your Student ID to link this card.</p>
+      `,
+      input: 'text',
+      inputLabel: 'Student ID',
+      inputPlaceholder: 'e.g. 2023-12345',
+      showCancelButton: true,
+      confirmButtonText: 'Save & Link',
+      confirmButtonColor: '#2ecc71',
+      cancelButtonColor: '#d33',
+      inputValidator: (value) => {
+        if (!value) {
+          return 'You need to write your Student ID!';
+        }
+      }
+    });
+
+    if (studentId) {
+      setLoadingText('Verifying ID...');
+      
+      // 2. Find Student in Database
+      try {
+        const { data: student, error } = await supabase
+          .from('students')
+          .select('*')
+          .eq('student_id', studentId)
+          .single();
+
+        setLoadingText('');
+
+        if (error || !student) {
+          // 3a. Student Not Found
+          Swal.fire({
+            icon: 'error',
+            title: 'Student Not Found',
+            text: 'Please register first on our website by uploading your COR or go to the Admin office.',
+            confirmButtonColor: '#3085d6'
+          });
+        } else {
+          // 3b. Student Found - Update RFID
+          const { error: updateError } = await supabase
+            .from('students')
+            .update({ rfid_uid: uid })
+            .eq('id', student.id);
+
+          if (updateError) {
+            Swal.fire('Error', 'Failed to update database.', 'error');
+          } else {
+            await Swal.fire({
+              icon: 'success',
+              title: 'Linked Successfully!',
+              text: `RFID Card assigned to ${student.full_name}`,
+              timer: 2000,
+              showConfirmButton: false
+            });
+            setView('menu'); // Return to menu
+          }
+        }
+      } catch (err) {
+        setLoadingText('');
+        console.error(err);
+        Swal.fire('Error', 'Connection error occurred.', 'error');
+      }
+    }
   };
 
   const loginKiosk = async () => {
@@ -172,7 +241,6 @@ function App() {
     }
   };
 
-  // --- NEW: ADMIN EXIT FUNCTION ---
   const handleAdminExit = async () => {
     const { value: formValues } = await Swal.fire({
       title: 'Admin Exit',
@@ -184,9 +252,6 @@ function App() {
           <input id="swal-input2" class="swal2-input" placeholder="Password" type="password" style="margin-top: 5px;">
         </div>
       `,
-      background: '#F5EBFA',
-      color: '#49225B',
-      confirmButtonColor: '#FF6600',
       confirmButtonText: 'Exit Kiosk',
       focusConfirm: false,
       showCancelButton: true,
@@ -200,9 +265,7 @@ function App() {
 
     if (formValues) {
       const [username, password] = formValues;
-      
       try {
-        // Call your existing Admin System Backend (Running on Port 5000)
         const response = await fetch('http://localhost:5000/api/auth/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -217,8 +280,7 @@ function App() {
            Swal.fire({icon: 'error', title: 'Authentication Failed', text: 'Invalid Admin Credentials'});
         }
       } catch (err) {
-        console.error(err);
-        Swal.fire({icon: 'error', title: 'Server Error', text: 'Cannot reach Admin Server (Port 5000)'});
+        Swal.fire({icon: 'error', title: 'Server Error', text: 'Cannot reach Admin Server'});
       }
     }
   };
@@ -274,18 +336,9 @@ function App() {
     setView('idle');
   };
 
-  const completeRegistration = async (uid) => {
-    if (!tempRegStudent) return;
-    const { error } = await supabase.from('students').update({ rfid_uid: uid }).eq('id', tempRegStudent.id);
-    if(!error) {
-      Swal.fire('Linked!', 'RFID Card assigned successfully.', 'success');
-      setTempRegStudent(null);
-      setView('menu');
-    }
-  };
-
   return (
     <div className="container">
+      {/* Hidden element to store view state for Socket.io listener */}
       <div id="app-view-state" data-view={view} style={{display:'none'}}></div>
 
       {loadingText && (
@@ -323,11 +376,26 @@ function App() {
           </motion.div>
         )}
 
-        {/* 3. IDLE MODE (AFK) */}
+        {/* 3. REGISTER SCAN MODE (New) */}
+        {view === 'register_scan' && (
+          <motion.div key="register_scan" initial={{scale:0.9, opacity:0}} animate={{scale:1, opacity:1}} exit={{scale:0.9, opacity:0}} className="flex flex-col items-center justify-center h-full">
+            <div className="bg-white p-10 rounded-2xl shadow-xl flex flex-col items-center text-gray-800">
+              <div className="animate-pulse mb-6">
+                <FaWifi style={{ fontSize: '5rem', color: '#FF6600' }} />
+              </div>
+              <h2 className="text-3xl font-bold mb-2">Scan RFID Card</h2>
+              <p className="text-lg opacity-70">Tap the card on the reader to register</p>
+            </div>
+            <button className="btn btn-outline mt-8 bg-white text-gray-800 hover:bg-gray-200" onClick={() => setView('menu')}>
+              <FaArrowLeft/> Return to Menu
+            </button>
+          </motion.div>
+        )}
+
+        {/* 4. IDLE MODE (AFK) */}
         {view === 'idle' && (
           <motion.div key="idle" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}} onClick={startAttendanceMode} className="idle-container relative w-full h-full flex flex-col items-center justify-center">
             
-            {/* NEW: ADMIN EXIT BUTTON (Top Right) */}
             <button 
               onClick={(e) => { e.stopPropagation(); handleAdminExit(); }}
               className="absolute top-8 right-8 flex items-center gap-2 bg-white/10 hover:bg-red-500/80 text-white px-4 py-2 rounded-full backdrop-blur-sm transition-colors z-50"
@@ -343,8 +411,8 @@ function App() {
           </motion.div>
         )}
 
-        {/* 4. CAMERA VIEW */}
-        {(view === 'attendance' || view === 'register_face') && (
+        {/* 5. ATTENDANCE CAMERA VIEW */}
+        {view === 'attendance' && (
           <motion.div key="camera" initial={{scale:0.9, opacity:0}} animate={{scale:1, opacity:1}} exit={{scale:0.9, opacity:0}} className="flex flex-col items-center">
             <div className="camera-wrapper">
               {modelsLoaded && (
@@ -355,16 +423,9 @@ function App() {
               )}
               <div className="overlay-message">
                 <div className="badge">
-                  {view === 'attendance' ? <span className="flex items-center gap-2"><FaCamera/> Look at camera & Tap RFID</span> : <span className="flex items-center gap-2"><FaIdCard/> Identifying Student...</span>}
+                  <span className="flex items-center gap-2"><FaCamera/> Look at camera & Tap RFID</span>
                 </div>
               </div>
-            </div>
-
-            {/* Control Buttons - No Exit in Attendance anymore */}
-            <div className="btn-group">
-              {view === 'register_face' && (
-                 <button className="btn btn-outline" onClick={() => setView('menu')}>Cancel</button>
-              )}
             </div>
           </motion.div>
         )}
