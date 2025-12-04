@@ -14,31 +14,62 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// --- SERIAL PORT CONFIGURATION ---
-const portPath = process.env.SERIAL_PORT || 'COM6'; 
-let port;
+// --- DYNAMIC SERIAL PORT CONFIGURATION ---
+let port = null;
+let currentPortPath = process.env.SERIAL_PORT || 'COM6'; // Default
 
-try {
-  port = new SerialPort({ path: portPath, baudRate: 9600 });
-  const parser = port.pipe(new ReadlineParser({ delimiter: '\r\n' }));
+const connectToPort = (path) => {
+  // 1. Close existing if open
+  if (port && port.isOpen) {
+    console.log('Closing previous port...');
+    port.close();
+  }
 
-  port.on('open', () => {
-    console.log(`🔌 Serial connected on ${portPath}`);
+  currentPortPath = path;
+
+  try {
+    console.log(`🔌 Attempting to connect to ${path}...`);
+    port = new SerialPort({ path: path, baudRate: 9600 });
+    const parser = port.pipe(new ReadlineParser({ delimiter: '\r\n' }));
+
+    port.on('open', () => {
+      console.log(`✅ Serial connected on ${path}`);
+      io.emit('status-update', { port: path, status: 'connected' });
+    });
+
+    parser.on('data', (data) => {
+      const uid = data.trim();
+      console.log('💳 RFID Scanned:', uid);
+      io.emit('rfid-tag', uid);
+    });
+
+    port.on('error', (err) => {
+      console.error(`⚠️ Serial Error on ${path}:`, err.message);
+      io.emit('status-update', { port: path, status: 'error' });
+    });
+
+  } catch (error) {
+    console.log(`❌ Could not open ${path}. Ensure ESP8266 is connected.`);
+    io.emit('status-update', { port: path, status: 'failed' });
+  }
+};
+
+// Initial Connection
+connectToPort(currentPortPath);
+
+// --- SOCKET HANDLERS ---
+io.on('connection', (socket) => {
+  console.log('💻 Client connected');
+
+  // Send current config on connect
+  socket.emit('current-config', { port: currentPortPath });
+
+  // Handle Port Change Request from Frontend
+  socket.on('change-port', (newPath) => {
+    console.log(`🔄 Switching port to ${newPath}`);
+    connectToPort(newPath);
   });
-
-  parser.on('data', (data) => {
-    const uid = data.trim();
-    console.log('💳 RFID Scanned:', uid);
-    // Broadcast RFID UID to React Client
-    io.emit('rfid-tag', uid); 
-  });
-
-  port.on('error', (err) => {
-    console.error('Serial Error:', err.message);
-  });
-} catch (error) {
-  console.log('⚠️ Serial Port not found. Ensure ESP8266 is connected.');
-}
+});
 
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
