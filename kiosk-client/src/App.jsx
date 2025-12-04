@@ -16,6 +16,8 @@ const socket = io('http://localhost:4000');
 
 function App() {
   const [view, setView] = useState('menu'); 
+  // views: menu, login, register_scan, idle, attendance
+  
   const [deviceKey, setDeviceKey] = useState('');
   const [deviceId, setDeviceId] = useState(null);
   
@@ -64,43 +66,57 @@ function App() {
   const syncDataAndTrain = async () => {
     setLoadingText('Syncing Database & Training Faces...');
     
-    const { data: std } = await supabase.from('students').select('*');
-    const { data: sch } = await supabase.from('schedules').select('*');
-    
-    if (std) setStudents(std);
-    if (sch) setSchedules(sch);
+    try {
+      const { data: std, error: stdError } = await supabase.from('students').select('*');
+      const { data: sch, error: schError } = await supabase.from('schedules').select('*');
+      
+      if (stdError) throw stdError;
+      if (schError) throw schError;
 
-    if (std && std.length > 0) {
-      const labeledDescriptors = await Promise.all(
-        std.map(async (student) => {
-          if (!student.face_image_url) return null;
-          try {
-            const img = await faceapi.fetchImage(student.face_image_url);
-            const detections = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
-            if (!detections) return null;
-            return new faceapi.LabeledFaceDescriptors(student.student_id, [detections.descriptor]);
-          } catch (err) {
-            return null;
-          }
-        })
-      );
-
-      const validDescriptors = labeledDescriptors.filter(d => d !== null);
-      if (validDescriptors.length > 0) {
-        setFaceMatcher(new faceapi.FaceMatcher(validDescriptors, 0.6));
+      if (std) {
+        setStudents(std);
+        console.log(`📚 Synced ${std.length} students`);
       }
+      if (sch) setSchedules(sch);
+
+      if (std && std.length > 0) {
+        const labeledDescriptors = await Promise.all(
+          std.map(async (student) => {
+            if (!student.face_image_url) return null;
+            try {
+              const img = await faceapi.fetchImage(student.face_image_url);
+              const detections = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
+              if (!detections) return null;
+              return new faceapi.LabeledFaceDescriptors(student.student_id, [detections.descriptor]);
+            } catch (err) {
+              return null;
+            }
+          })
+        );
+
+        const validDescriptors = labeledDescriptors.filter(d => d !== null);
+        if (validDescriptors.length > 0) {
+          setFaceMatcher(new faceapi.FaceMatcher(validDescriptors, 0.6));
+        }
+      }
+    } catch (error) {
+      console.error("Sync Error:", error);
+      Swal.fire("Sync Error", "Could not download data. Check internet connection.", "error");
     }
     setLoadingText('');
   };
 
   // --- 3. RFID LOGIC ROUTER ---
   const handleRfidScan = (uid) => {
+    const cleanUid = uid ? uid.toString().trim() : "";
     const currentView = document.getElementById('app-view-state')?.getAttribute('data-view');
 
+    console.log(`💳 Scan Detected. View: ${currentView}, UID: ${cleanUid}`);
+
     if (currentView === 'register_scan') {
-      handleRegistrationScan(uid);
+      handleRegistrationScan(cleanUid);
     } else if (currentView === 'attendance') {
-      processAttendance(uid);
+      processAttendance(cleanUid);
     }
   };
 
@@ -147,15 +163,10 @@ function App() {
     setView('register_scan');
   };
 
-  // UPDATED FUNCTION: Correctly handles Pending Registrations Schema
   const handleRegistrationScan = async (uid) => {
-    // 1. Popup to ask for Student ID
     const { value: studentId } = await Swal.fire({
       title: 'Card Detected!',
-      html: `
-        <p>UID: <strong>${uid}</strong></p>
-        <p class="mt-2">Please enter your Student ID to link this card.</p>
-      `,
+      html: `<p>UID: <strong>${uid}</strong></p><p class="mt-2">Please enter your Student ID to link this card.</p>`,
       input: 'text',
       inputLabel: 'Student ID',
       inputPlaceholder: 'e.g. 2023-12345',
@@ -170,111 +181,62 @@ function App() {
 
     if (studentId) {
       setLoadingText('Verifying ID...');
-
       try {
-        // --- CHECK 1: Is student already in the main 'students' table? ---
+        // Check Students Table
         const { data: existingStudent, error: findError } = await supabase
-          .from('students')
-          .select('*')
-          .eq('student_id', studentId)
-          .maybeSingle();
+          .from('students').select('*').eq('student_id', studentId).maybeSingle();
 
         if (findError) throw findError;
 
         if (existingStudent) {
-          // A. Student exists: Just update RFID
           const { error: updateError } = await supabase
-            .from('students')
-            .update({ rfid_uid: uid })
-            .eq('id', existingStudent.id);
-
+            .from('students').update({ rfid_uid: uid }).eq('id', existingStudent.id);
+          
           setLoadingText('');
-
           if (updateError) throw updateError;
 
-          await Swal.fire({
-            icon: 'success',
-            title: 'Linked Successfully!',
-            text: `RFID Card assigned to ${existingStudent.full_name}`,
-            timer: 2000,
-            showConfirmButton: false
-          });
+          await Swal.fire({ icon: 'success', title: 'Linked Successfully!', text: `RFID Card assigned to ${existingStudent.full_name}`, timer: 2000, showConfirmButton: false });
           setView('menu');
           return;
         }
 
-        // --- CHECK 2: Is student in 'pending_registrations' table? ---
+        // Check Pending Table
         const { data: pendingStudent, error: pendingError } = await supabase
-          .from('pending_registrations') 
-          .select('*')
-          .eq('student_id', studentId)
-          .maybeSingle();
+          .from('pending_registrations').select('*').eq('student_id', studentId).maybeSingle();
 
         if (pendingError) throw pendingError;
 
         if (pendingStudent) {
-          // B. Student found in Pending: Approve them automatically
           setLoadingText('Approving Student...');
-          
-          console.log("Pending Student Found:", pendingStudent);
+          const middle = pendingStudent.middle_name ? ` ${pendingStudent.middle_name} ` : ' ';
+          const fullName = `${pendingStudent.given_name}${middle}${pendingStudent.surname}`.trim();
 
-          // Construct full name from parts
-          const middleName = pendingStudent.middle_name ? ` ${pendingStudent.middle_name} ` : ' ';
-          const fullName = `${pendingStudent.given_name}${middleName}${pendingStudent.surname}`;
+          const { error: insertError } = await supabase.from('students').insert([{
+            student_id: pendingStudent.student_id,
+            full_name: fullName, 
+            course: pendingStudent.course,
+            face_image_url: pendingStudent.face_image_url,
+            enrolled_subjects: pendingStudent.enrolled_subjects,
+            rfid_uid: uid 
+          }]);
 
-          // 1. Move to main 'students' table with exact schema mapping
-          const { error: insertError } = await supabase
-            .from('students')
-            .insert([{
-              student_id: pendingStudent.student_id,
-              full_name: fullName.trim(), // Combine names
-              course: pendingStudent.course,
-              face_image_url: pendingStudent.face_image_url,
-              enrolled_subjects: pendingStudent.enrolled_subjects,
-              rfid_uid: uid // Assign the new RFID immediately
-            }]);
+          if (insertError) throw insertError;
 
-          if (insertError) {
-            console.error("Insert Failed:", insertError);
-            throw new Error(`Insert failed: ${insertError.message}`);
-          }
-
-          // 2. Remove from 'pending_registrations'
-          const { error: deleteError } = await supabase
-            .from('pending_registrations')
-            .delete()
-            .eq('id', pendingStudent.id);
-            
-          if (deleteError) console.error("Warning: Could not delete from pending", deleteError);
-
+          await supabase.from('pending_registrations').delete().eq('id', pendingStudent.id);
           setLoadingText('');
 
-          await Swal.fire({
-            icon: 'success',
-            title: 'Approved & Registered!',
-            html: `Student <strong>${fullName}</strong> has been approved and linked.`,
-            timer: 3000,
-            showConfirmButton: false
-          });
-          
-          // Refresh local data
+          await Swal.fire({ icon: 'success', title: 'Approved & Registered!', html: `Student <strong>${fullName}</strong> has been approved and linked.`, timer: 3000, showConfirmButton: false });
           await syncDataAndTrain();
           setView('menu');
           return;
         }
 
-        // --- CHECK 3: Student not found anywhere ---
         setLoadingText('');
-        Swal.fire({
-          icon: 'error',
-          title: 'Student Not Found',
-          text: 'Please register first on our website by uploading your COR or go to the Admin office.',
-          confirmButtonColor: '#3085d6'
-        });
+        Swal.fire({ icon: 'error', title: 'Student Not Found', text: 'Please register first on our website.', confirmButtonColor: '#3085d6' });
 
       } catch (err) {
         setLoadingText('');
-        console.error("FULL ERROR OBJECT:", err);
+        console.error("Error:", err);
         Swal.fire('Error', err.message || 'Database operation failed.', 'error');
       }
     }
@@ -284,10 +246,7 @@ function App() {
     if (!deviceKey) return Swal.fire('Error', 'Enter a key', 'error');
     
     const { data, error } = await supabase
-      .from('devices')
-      .select('id, device_name')
-      .eq('connection_key', deviceKey)
-      .single();
+      .from('devices').select('id, device_name').eq('connection_key', deviceKey).single();
 
     if (error || !data) {
       Swal.fire('Access Denied', 'Invalid Key', 'error');
@@ -313,12 +272,7 @@ function App() {
       confirmButtonText: 'Exit Kiosk',
       focusConfirm: false,
       showCancelButton: true,
-      preConfirm: () => {
-        return [
-          document.getElementById('swal-input1').value,
-          document.getElementById('swal-input2').value
-        ]
-      }
+      preConfirm: () => [document.getElementById('swal-input1').value, document.getElementById('swal-input2').value]
     });
 
     if (formValues) {
@@ -343,7 +297,8 @@ function App() {
     }
   };
 
-  const startAttendanceMode = () => {
+  const startAttendanceMode = async () => {
+    await syncDataAndTrain();
     setView('attendance');
     if (idleTimeoutRef.current) clearTimeout(idleTimeoutRef.current);
     idleTimeoutRef.current = setTimeout(() => {
@@ -352,30 +307,80 @@ function App() {
     }, 20000); 
   };
 
+  // --- UPDATED ATTENDANCE LOGIC WITH ENROLLMENT CHECK ---
   const processAttendance = async (uid) => {
     if (idleTimeoutRef.current) clearTimeout(idleTimeoutRef.current);
     idleTimeoutRef.current = setTimeout(() => setView('idle'), 20000);
 
-    const student = students.find(s => s.rfid_uid === uid);
-    if (!student) return Swal.fire({ icon: 'error', title: 'Unregistered Card', timer: 1500, showConfirmButton: false });
+    const cleanUid = uid.toString().trim();
+    console.log("Processing Attendance for:", cleanUid);
+
+    // 1. Identify Student
+    const student = students.find(s => 
+      s.rfid_uid && s.rfid_uid.trim().toLowerCase() === cleanUid.toLowerCase()
+    );
+
+    if (!student) {
+      return Swal.fire({ 
+        icon: 'error', 
+        title: 'Unregistered Card', 
+        text: `Card ID: ${cleanUid}`,
+        timer: 2000, 
+        showConfirmButton: false 
+      });
+    }
 
     const now = new Date();
     const currentTime = now.toTimeString().slice(0,5);
     const currentDay = now.toLocaleDateString('en-US', { weekday: 'short' });
 
+    // 2. Find Active Class
     const activeClass = schedules.find(s => 
       s.days.includes(currentDay) && currentTime >= s.time_start && currentTime <= s.time_end
     );
 
-    if (!activeClass) return Swal.fire({ icon: 'warning', title: 'No Class Scheduled', timer: 2000 });
+    if (!activeClass) {
+      return Swal.fire({ 
+        icon: 'warning', 
+        title: 'No Class Scheduled', 
+        text: `Time: ${currentTime} (${currentDay})`,
+        timer: 2000 
+      });
+    }
 
+    // 3. NEW: Check Enrollment (Is student enrolled in this subject?)
+    // Assuming enrolled_subjects is a string containing codes (e.g. "IT101, CS102")
+    const subjects = student.enrolled_subjects || "";
+    if (!subjects.includes(activeClass.subject_code)) {
+      return Swal.fire({
+        icon: 'error',
+        title: 'Not Enrolled',
+        html: `You are not enrolled in:<br/><strong>${activeClass.subject_code}</strong><br/>${activeClass.subject_name}`,
+        timer: 3000,
+        showConfirmButton: false
+      });
+    }
+
+    // 4. Check Previous Attendance
     const today = now.toISOString().split('T')[0];
     const { data: logs } = await supabase.from('attendance_logs')
-      .select('*').eq('student_id', student.student_id).eq('subject_code', activeClass.subject_code).eq('date', today);
+      .select('*')
+      .eq('student_id', student.student_id)
+      .eq('subject_code', activeClass.subject_code)
+      .eq('date', today);
 
-    if (logs?.length > 0) return Swal.fire({ icon: 'info', title: 'Already Present', timer: 2000, showConfirmButton: false });
+    if (logs?.length > 0) {
+      return Swal.fire({ 
+        icon: 'info', 
+        title: 'Already Present', 
+        text: `${student.full_name} is already logged.`,
+        timer: 2000, 
+        showConfirmButton: false 
+      });
+    }
 
-    await supabase.from('attendance_logs').insert([{
+    // 5. Record Attendance
+    const { error } = await supabase.from('attendance_logs').insert([{
       student_id: student.student_id,
       student_name: student.full_name,
       subject_code: activeClass.subject_code,
@@ -384,19 +389,28 @@ function App() {
       status: 'present'
     }]);
 
+    if(error) {
+      console.error("Attendance Insert Error:", error);
+      return Swal.fire({ icon: 'error', title: 'Save Failed', text: error.message });
+    }
+
     await Swal.fire({
       icon: 'success',
       title: 'Attendance Recorded',
-      html: `<div style="text-align: left;"><strong>${student.full_name}</strong><br/>${activeClass.subject_name}<br/><span style="color:green">PRESENT</span></div>`,
+      html: `<div style="text-align: left;">
+              <strong>${student.full_name}</strong><br/>
+              ${activeClass.subject_name}<br/>
+              <span style="color:green">PRESENT</span>
+             </div>`,
       timer: 3000,
       showConfirmButton: false
     });
+    
     setView('idle');
   };
 
   return (
     <div className="container">
-      {/* Hidden element to store view state for Socket.io listener */}
       <div id="app-view-state" data-view={view} style={{display:'none'}}></div>
 
       {loadingText && (
@@ -407,8 +421,6 @@ function App() {
       )}
 
       <AnimatePresence mode='wait'>
-        
-        {/* 1. MAIN MENU */}
         {view === 'menu' && (
           <motion.div key="menu" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}} className="card-grid">
             <div className="menu-card" onClick={startRegister}>
@@ -422,7 +434,6 @@ function App() {
           </motion.div>
         )}
 
-        {/* 2. KIOSK LOGIN */}
         {view === 'login' && (
           <motion.div key="login" initial={{y:50, opacity:0}} animate={{y:0, opacity:1}} exit={{opacity:0}} className="flex flex-col items-center">
             <h2 className="text-2xl mb-6 font-bold">Kiosk Authorization</h2>
@@ -434,7 +445,6 @@ function App() {
           </motion.div>
         )}
 
-        {/* 3. REGISTER SCAN MODE (New) */}
         {view === 'register_scan' && (
           <motion.div key="register_scan" initial={{scale:0.9, opacity:0}} animate={{scale:1, opacity:1}} exit={{scale:0.9, opacity:0}} className="flex flex-col items-center justify-center h-full">
             <div className="bg-white p-10 rounded-2xl shadow-xl flex flex-col items-center text-gray-800">
@@ -450,17 +460,14 @@ function App() {
           </motion.div>
         )}
 
-        {/* 4. IDLE MODE (AFK) */}
         {view === 'idle' && (
           <motion.div key="idle" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}} onClick={startAttendanceMode} className="idle-container relative w-full h-full flex flex-col items-center justify-center">
-            
             <button 
               onClick={(e) => { e.stopPropagation(); handleAdminExit(); }}
               className="absolute top-8 right-8 flex items-center gap-2 bg-white/10 hover:bg-red-500/80 text-white px-4 py-2 rounded-full backdrop-blur-sm transition-colors z-50"
             >
               <FaUserShield /> <span>Admin Exit</span>
             </button>
-
             <h1 style={{ fontSize: '5rem', fontWeight: 'bold', lineHeight: 1 }}>Smart<br/>Attendance</h1>
             <p style={{ fontSize: '1.5rem', marginTop: '20px', opacity: 0.8 }}>Touch screen to start</p>
             <motion.div animate={{ y: [0, 15, 0] }} transition={{ repeat: Infinity, duration: 2 }} style={{ fontSize: '4rem', marginTop: '40px', color: 'var(--accent)' }}>
@@ -469,7 +476,6 @@ function App() {
           </motion.div>
         )}
 
-        {/* 5. ATTENDANCE CAMERA VIEW */}
         {view === 'attendance' && (
           <motion.div key="camera" initial={{scale:0.9, opacity:0}} animate={{scale:1, opacity:1}} exit={{scale:0.9, opacity:0}} className="flex flex-col items-center">
             <div className="camera-wrapper">
