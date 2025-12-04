@@ -7,7 +7,7 @@ import io from 'socket.io-client';
 import { supabase } from './supabaseClient';
 import { 
   FaUserPlus, FaDesktop, FaFingerprint, 
-  FaArrowLeft, FaCamera, FaIdCard, FaCheckCircle, FaUserShield, FaWifi 
+  FaArrowLeft, FaCamera, FaCheckCircle, FaUserShield, FaWifi 
 } from 'react-icons/fa';
 import './styles.css';
 
@@ -16,8 +16,6 @@ const socket = io('http://localhost:4000');
 
 function App() {
   const [view, setView] = useState('menu'); 
-  // views: menu, login, register_scan, idle, attendance
-  
   const [deviceKey, setDeviceKey] = useState('');
   const [deviceId, setDeviceId] = useState(null);
   
@@ -97,7 +95,6 @@ function App() {
 
   // --- 3. RFID LOGIC ROUTER ---
   const handleRfidScan = (uid) => {
-    // We use getAttribute to avoid stale state in the socket listener closure
     const currentView = document.getElementById('app-view-state')?.getAttribute('data-view');
 
     if (currentView === 'register_scan') {
@@ -147,10 +144,10 @@ function App() {
   // --- 5. FLOW FUNCTIONS ---
 
   const startRegister = () => {
-    // Directly go to Scan RFID mode (Skipping face scan)
     setView('register_scan');
   };
 
+  // UPDATED FUNCTION: Correctly handles Pending Registrations Schema
   const handleRegistrationScan = async (uid) => {
     // 1. Popup to ask for Student ID
     const { value: studentId } = await Swal.fire({
@@ -167,57 +164,118 @@ function App() {
       confirmButtonColor: '#2ecc71',
       cancelButtonColor: '#d33',
       inputValidator: (value) => {
-        if (!value) {
-          return 'You need to write your Student ID!';
-        }
+        if (!value) return 'You need to write your Student ID!';
       }
     });
 
     if (studentId) {
       setLoadingText('Verifying ID...');
-      
-      // 2. Find Student in Database
+
       try {
-        const { data: student, error } = await supabase
+        // --- CHECK 1: Is student already in the main 'students' table? ---
+        const { data: existingStudent, error: findError } = await supabase
           .from('students')
           .select('*')
           .eq('student_id', studentId)
-          .single();
+          .maybeSingle();
 
-        setLoadingText('');
+        if (findError) throw findError;
 
-        if (error || !student) {
-          // 3a. Student Not Found
-          Swal.fire({
-            icon: 'error',
-            title: 'Student Not Found',
-            text: 'Please register first on our website by uploading your COR or go to the Admin office.',
-            confirmButtonColor: '#3085d6'
-          });
-        } else {
-          // 3b. Student Found - Update RFID
+        if (existingStudent) {
+          // A. Student exists: Just update RFID
           const { error: updateError } = await supabase
             .from('students')
             .update({ rfid_uid: uid })
-            .eq('id', student.id);
+            .eq('id', existingStudent.id);
 
-          if (updateError) {
-            Swal.fire('Error', 'Failed to update database.', 'error');
-          } else {
-            await Swal.fire({
-              icon: 'success',
-              title: 'Linked Successfully!',
-              text: `RFID Card assigned to ${student.full_name}`,
-              timer: 2000,
-              showConfirmButton: false
-            });
-            setView('menu'); // Return to menu
-          }
+          setLoadingText('');
+
+          if (updateError) throw updateError;
+
+          await Swal.fire({
+            icon: 'success',
+            title: 'Linked Successfully!',
+            text: `RFID Card assigned to ${existingStudent.full_name}`,
+            timer: 2000,
+            showConfirmButton: false
+          });
+          setView('menu');
+          return;
         }
+
+        // --- CHECK 2: Is student in 'pending_registrations' table? ---
+        const { data: pendingStudent, error: pendingError } = await supabase
+          .from('pending_registrations') 
+          .select('*')
+          .eq('student_id', studentId)
+          .maybeSingle();
+
+        if (pendingError) throw pendingError;
+
+        if (pendingStudent) {
+          // B. Student found in Pending: Approve them automatically
+          setLoadingText('Approving Student...');
+          
+          console.log("Pending Student Found:", pendingStudent);
+
+          // Construct full name from parts
+          const middleName = pendingStudent.middle_name ? ` ${pendingStudent.middle_name} ` : ' ';
+          const fullName = `${pendingStudent.given_name}${middleName}${pendingStudent.surname}`;
+
+          // 1. Move to main 'students' table with exact schema mapping
+          const { error: insertError } = await supabase
+            .from('students')
+            .insert([{
+              student_id: pendingStudent.student_id,
+              full_name: fullName.trim(), // Combine names
+              course: pendingStudent.course,
+              face_image_url: pendingStudent.face_image_url,
+              enrolled_subjects: pendingStudent.enrolled_subjects,
+              rfid_uid: uid // Assign the new RFID immediately
+            }]);
+
+          if (insertError) {
+            console.error("Insert Failed:", insertError);
+            throw new Error(`Insert failed: ${insertError.message}`);
+          }
+
+          // 2. Remove from 'pending_registrations'
+          const { error: deleteError } = await supabase
+            .from('pending_registrations')
+            .delete()
+            .eq('id', pendingStudent.id);
+            
+          if (deleteError) console.error("Warning: Could not delete from pending", deleteError);
+
+          setLoadingText('');
+
+          await Swal.fire({
+            icon: 'success',
+            title: 'Approved & Registered!',
+            html: `Student <strong>${fullName}</strong> has been approved and linked.`,
+            timer: 3000,
+            showConfirmButton: false
+          });
+          
+          // Refresh local data
+          await syncDataAndTrain();
+          setView('menu');
+          return;
+        }
+
+        // --- CHECK 3: Student not found anywhere ---
+        setLoadingText('');
+        Swal.fire({
+          icon: 'error',
+          title: 'Student Not Found',
+          text: 'Please register first on our website by uploading your COR or go to the Admin office.',
+          confirmButtonColor: '#3085d6'
+        });
+
       } catch (err) {
         setLoadingText('');
-        console.error(err);
-        Swal.fire('Error', 'Connection error occurred.', 'error');
+        console.error("FULL ERROR OBJECT:", err);
+        Swal.fire('Error', err.message || 'Database operation failed.', 'error');
       }
     }
   };
