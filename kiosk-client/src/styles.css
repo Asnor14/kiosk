@@ -232,3 +232,26 @@ input:checked + .slider:before { transform: translateX(22px); }
   .fingerprint { font-size: 4rem; }
   .exit-link { top: 10px; right: 10px; padding: 8px 15px; font-size: 0.8rem; }
 }
+
+/* --- Timer Badge --- */
+.timer-badge {
+  background: var(--brand-orange);
+  color: var(--white);
+  padding: 10px 25px;
+  border-radius: 50px;
+  font-size: 1.5rem;
+  font-weight: 800;
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  box-shadow: 0 10px 30px rgba(252, 110, 32, 0.4);
+  animation: pulse-orange 2s infinite;
+  border: 2px solid rgba(255,255,255,0.2);
+}
+
+@keyframes pulse-orange {
+  0% { box-shadow: 0 0 0 0 rgba(252, 110, 32, 0.7); }
+  70% { box-shadow: 0 0 0 15px rgba(252, 110, 32, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(252, 110, 32, 0); }
+}

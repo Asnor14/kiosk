@@ -8,7 +8,7 @@ import { supabase } from './supabaseClient';
 import { db } from './db'; 
 import { 
   FaUserPlus, FaDesktop, FaFingerprint, FaCog,
-  FaArrowLeft, FaCamera, FaPowerOff, FaWifi, FaVideoSlash, FaSignOutAlt, FaIdCard, FaSync, FaCloudUploadAlt, FaDatabase
+  FaArrowLeft, FaCamera, FaPowerOff, FaWifi, FaVideoSlash, FaSignOutAlt, FaIdCard, FaSync, FaCloudUploadAlt, FaDatabase, FaClock
 } from 'react-icons/fa';
 import './styles.css';
 
@@ -30,7 +30,7 @@ function App() {
   
   // Data State
   const [studentsCount, setStudentsCount] = useState(0);
-  const [schedulesCount, setSchedulesCount] = useState(0); // Changed to count to avoid massive array in state
+  const [schedules, setSchedules] = useState([]); 
   const [pendingUploads, setPendingUploads] = useState(0);
   
   // System State
@@ -44,10 +44,12 @@ function App() {
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [selectedPort, setSelectedPort] = useState('COM6');
   const [portStatus, setPortStatus] = useState('unknown');
+  
+  // NEW: Timer State
+  const [timeLeft, setTimeLeft] = useState(30);
 
   const webcamRef = useRef(null);
   const canvasRef = useRef(null);
-  const idleTimeoutRef = useRef(null);
   const lastScannedRef = useRef({ uid: '', time: 0 });
 
   // --- 1. INITIALIZATION ---
@@ -56,11 +58,7 @@ function App() {
       setLoadingText('Starting System...');
       
       await loadModels();
-      
-      // FIX: Clean up OLD logs (yesterday or older) on boot
-      // This ensures the DB doesn't get huge, but keeps TODAY'S logs for duplicate checking
       await cleanupDailyLogs();
-      
       await updateLocalStats();
 
       socket.on('rfid-tag', (uid) => handleRfidScan(uid));
@@ -78,14 +76,12 @@ function App() {
         setLoadingText('');
       }
 
-      // Background Sync
       const syncInterval = setInterval(() => {
         if(navigator.onLine && deviceId) {
           uploadLogs();
-          // Optional: Silent refresh of schedules every 2 mins to be safe
-          downloadDataToLocal(deviceId); 
+          downloadDataToLocal(deviceId);
         }
-      }, 120000);
+      }, 30000);
 
       return () => clearInterval(syncInterval);
     };
@@ -98,6 +94,30 @@ function App() {
     };
   }, []);
 
+  // --- NEW: VISUAL COUNTDOWN TIMER ---
+  useEffect(() => {
+    let timer;
+    if (view === 'attendance') {
+      timer = setInterval(() => {
+        setTimeLeft((prev) => {
+          if (prev <= 1) {
+            // Time is up! Go to sleep.
+            Swal.close(); // Close any open alerts so they don't stick
+            setView('idle');
+            return 30;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+    return () => clearInterval(timer);
+  }, [view]);
+
+  // Helper to reset timer when activity happens
+  const resetActivityTimer = () => {
+    setTimeLeft(30);
+  };
+
   // --- 2. REALTIME LISTENER ---
   useEffect(() => {
     if (!deviceId || !isOnline) return;
@@ -106,7 +126,6 @@ function App() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'schedules' }, 
         () => {
           console.log("🔔 Schedules changed. Syncing...");
-          // FIX: Trigger download immediately so Dexie is fresh
           downloadDataToLocal(deviceId);
         }
       )
@@ -123,23 +142,19 @@ function App() {
 
 
   // --- 3. SYNC ENGINE ---
-  
-  // FIX: Delete logs from yesterday so they don't block attendance today
   const cleanupDailyLogs = async () => {
     const today = new Date().toISOString().split('T')[0];
-    // Delete any log where date is NOT today
     await db.logs.where('date').notEqual(today).delete();
   };
 
   const updateLocalStats = async () => {
     const sCount = await db.students.count();
-    const schCount = await db.schedules.count();
-    // Only count 'pending' for the UI badge
     const lCount = await db.logs.where('sync_status').equals('pending').count();
+    const sch = await db.schedules.toArray();
     
     setStudentsCount(sCount);
-    setSchedulesCount(schCount);
     setPendingUploads(lCount);
+    setSchedules(sch);
   };
 
   const downloadDataToLocal = async (currentKioskId) => {
@@ -151,12 +166,11 @@ function App() {
       const { data: schData } = await supabase.from('schedules').select('*');
 
       await db.transaction('rw', db.students, db.schedules, async () => {
-        // FIX: Clear tables explicitly to handle deletions from Admin
         await db.students.clear();
         await db.schedules.clear();
 
-        if (stdData && stdData.length > 0) await db.students.bulkPut(stdData);
-        if (schData && schData.length > 0) await db.schedules.bulkPut(schData);
+        if (stdData?.length) await db.students.bulkPut(stdData);
+        if (schData?.length) await db.schedules.bulkPut(schData);
       });
       
       await updateLocalStats();
@@ -184,11 +198,8 @@ function App() {
       const { error } = await supabase.from('attendance_logs').upsert(logsToUpload, { onConflict: 'student_id, subject_code, date' });
 
       if (!error) {
-        // FIX: DO NOT DELETE LOGS. Update status to 'synced'.
-        // This keeps the record in Dexie so we can detect duplicates locally for the rest of the day.
         const ids = pendingLogs.map(l => l.local_id);
         await db.logs.bulkUpdate(ids.map(id => ({ key: id, changes: { sync_status: 'synced' } })));
-        
         updateLocalStats();
       }
     } catch (err) {
@@ -196,7 +207,7 @@ function App() {
     }
   };
 
-  // --- 4. ATTENDANCE LOGIC ---
+  // --- 4. ATTENDANCE LOGIC (CONTINUOUS MODE) ---
   const processAttendance = async (uid) => {
     // A. RAPID FIRE PREVENTION
     const nowTs = Date.now();
@@ -204,45 +215,66 @@ function App() {
     if (lastScannedRef.current.uid === cleanUid && (nowTs - lastScannedRef.current.time) < 5000) return;
     lastScannedRef.current = { uid: cleanUid, time: nowTs };
 
-    if (idleTimeoutRef.current) clearTimeout(idleTimeoutRef.current);
-    idleTimeoutRef.current = setTimeout(() => setView('idle'), 20000);
+    // ** UX CHANGE: Reset Timer to 30s on scan, Stay on Page **
+    resetActivityTimer();
 
-    // B. FIND STUDENT (Local)
+    // B. FIND STUDENT (Direct DB)
     let student = await db.students.where('rfid_uid').equals(cleanUid).first();
     if (!student) {
        student = await db.students.filter(s => s.rfid_uid && s.rfid_uid.toLowerCase() === cleanUid.toLowerCase()).first();
     }
-    if (!student) return Swal.fire({ icon: 'error', title: 'Not Registered', timer: 3000 });
 
-    // C. CHECK SCHEDULE (FIX: Query DB directly to ensure freshness)
+    if (!student) {
+      return Swal.fire({ 
+        icon: 'error', 
+        title: 'Not Registered', 
+        text: `UID: ${cleanUid}`, 
+        timer: 2000, 
+        showConfirmButton: false 
+      });
+    }
+
+    // C. CHECK SCHEDULE (Direct DB)
     const now = new Date();
     const hours = String(now.getHours()).padStart(2, '0');
     const minutes = String(now.getMinutes()).padStart(2, '0');
     const currentTime = `${hours}:${minutes}`;
     const currentDay = now.toLocaleDateString('en-US', { weekday: 'short' });
 
-    // FIX: Fetch schedules from Dexie inside this function. 
-    // This ignores stale React state and gets the raw DB data immediately after sync.
     const allSchedules = await db.schedules.where('kiosk_id').equals(deviceId).toArray();
 
     const activeClass = allSchedules.find(s => {
       if (!s.days || !s.days.includes(currentDay)) return false;
-      // Handle "08:00:00" vs "08:00"
       const start = s.time_start.substring(0, 5);
       const end = s.time_end.substring(0, 5);
       return currentTime >= start && currentTime <= end;
     });
 
     if (!activeClass) {
-      return Swal.fire({ icon: 'warning', title: 'No Class Scheduled', text: `Time: ${currentTime}`, timer: 3000 });
+      return Swal.fire({ 
+        icon: 'warning', 
+        title: 'No Class', 
+        text: `${currentTime} (${currentDay})`, 
+        timer: 2000, 
+        showConfirmButton: false 
+      });
     }
 
     // D. CHECK ENROLLMENT
     const enrolledArr = student.enrolled_subjects ? student.enrolled_subjects.split(',') : [];
     const isEnrolled = enrolledArr.some(code => code.trim() === activeClass.subject_code);
-    if (!isEnrolled) return Swal.fire({ icon: 'error', title: 'Not Enrolled', text: activeClass.subject_name, timer: 3000 });
+    
+    if (!isEnrolled) {
+      return Swal.fire({ 
+        icon: 'error', 
+        title: 'Not Enrolled', 
+        text: activeClass.subject_name, 
+        timer: 2000, 
+        showConfirmButton: false 
+      });
+    }
 
-    // E. CHECK DUPLICATE (FIX: Checks Dexie which now KEEPS synced logs)
+    // E. CHECK DUPLICATE (LOCAL)
     const today = now.toISOString().split('T')[0];
     const existingLog = await db.logs
       .where({ student_id: student.student_id, subject_code: activeClass.subject_code, date: today })
@@ -252,8 +284,9 @@ function App() {
        return Swal.fire({ 
          icon: 'info', 
          title: 'Already Present', 
-         text: `Attendance recorded at ${new Date(existingLog.timestamp).toLocaleTimeString()}`, 
-         timer: 3000, showConfirmButton: false 
+         text: `${student.full_name}`, 
+         timer: 2000, 
+         showConfirmButton: false 
        });
     }
 
@@ -271,16 +304,25 @@ function App() {
 
     updateLocalStats(); 
 
-    // G. SUCCESS
+    // G. SUCCESS UI (Quick Toast, Continuous Mode)
     Swal.fire({
       icon: 'success',
-      title: 'Welcome!',
-      html: `<h2 style="color:#FC6E20">${student.full_name}</h2><p>${activeClass.subject_name}</p>`,
-      timer: 2000, showConfirmButton: false
+      title: 'Present!',
+      html: `
+        <h2 style="color:#FC6E20; font-weight:bold">${student.full_name}</h2>
+        <p style="margin:0">${activeClass.subject_name}</p>
+      `,
+      background: '#1B1B1B', 
+      color: '#FFE7D0',
+      timer: 2000, 
+      showConfirmButton: false,
+      position: 'center'
     });
 
     if (navigator.onLine) uploadLogs();
-    setView('idle');
+    
+    // ** IMPORTANT: Do NOT call setView('idle') here! **
+    // The timer hook handles the exit if no one else scans.
   };
 
   // --- 5. AUTH & SESSION ---
@@ -298,7 +340,7 @@ function App() {
         setLoadingText('');
       }
     } catch (e) {
-      Swal.fire('Error', 'Invalid Connection Key', 'error');
+      Swal.fire('Error', 'Invalid Key', 'error');
       setLoadingText('');
     }
   };
@@ -308,7 +350,7 @@ function App() {
         const cachedId = localStorage.getItem('kiosk_id');
         const cachedName = localStorage.getItem('kiosk_name');
         if(cachedId) {
-           setDeviceId(cachedId);
+           setDeviceId(parseInt(cachedId));
            setDeviceName(cachedName || 'Kiosk');
            await updateLocalStats(); 
            setView('idle');
@@ -349,8 +391,6 @@ function App() {
          if(navigator.onLine) await supabase.from('devices').update({ status: 'offline' }).eq('id', deviceId);
          localStorage.clear();
          setDeviceId(null);
-         setDeviceName(null);
-         setDeviceKey('');
          setView('menu');
       } else {
          Swal.fire('Error', 'Invalid Key', 'error');
@@ -441,11 +481,11 @@ function App() {
      socket.emit('change-port', e.target.value);
   };
   
+  // ** START ATTENDANCE FLOW **
   const startAttendance = () => {
+     setTimeLeft(30); // Init timer
      setView('attendance');
      if(navigator.onLine) uploadLogs();
-     if(idleTimeoutRef.current) clearTimeout(idleTimeoutRef.current);
-     idleTimeoutRef.current = setTimeout(() => setView('idle'), 20000);
   };
 
   const handleVideoOnPlay = () => {
@@ -479,7 +519,7 @@ function App() {
       
       {isSyncing && (
          <div className="fixed top-4 left-4 bg-brand-orange text-white px-4 py-2 rounded-full z-50 flex items-center gap-2 shadow-lg animate-pulse">
-            <FaSync className="animate-spin"/> Updating Database...
+            <FaSync className="animate-spin"/> Updating...
          </div>
       )}
 
@@ -507,7 +547,7 @@ function App() {
              <div className="bg-black/40 p-4 rounded-xl w-full mb-6 text-sm text-left">
                 <h3 className="text-brand-orange font-bold mb-2 flex items-center gap-2"><FaDatabase/> Local Data Status</h3>
                 <div className="flex justify-between border-b border-white/10 py-1"><span>Cached Students:</span><span className="font-mono">{studentsCount}</span></div>
-                <div className="flex justify-between border-b border-white/10 py-1"><span>Cached Schedules:</span><span className="font-mono">{schedulesCount}</span></div>
+                <div className="flex justify-between border-b border-white/10 py-1"><span>Cached Schedules:</span><span className="font-mono">{schedules.length}</span></div>
                 <div className="flex justify-between pt-1"><span>Logs to Upload:</span><span className="font-mono text-yellow-400">{pendingUploads}</span></div>
                 <button onClick={() => downloadDataToLocal(deviceId)} className="mt-3 bg-brand-charcoal hover:bg-gray-700 w-full py-2 rounded text-xs">Force Re-Sync</button>
              </div>
@@ -558,6 +598,11 @@ function App() {
 
         {view === 'attendance' && (
           <motion.div key="att" className="camera-view">
+             {/* VISUAL TIMER BADGE */}
+             <div className="timer-badge">
+                <FaClock/> Closing in {timeLeft}s
+             </div>
+
              <div className="camera-wrapper">
                 {cameraEnabled && modelsLoaded ? (
                    <>
@@ -573,7 +618,7 @@ function App() {
                    </div>
                 )}
              </div>
-             <button className="btn btn-secondary mt-4" onClick={()=>setView('idle')}>Cancel</button>
+             <button className="btn btn-secondary mt-4" onClick={()=>setView('idle')}>Cancel & Sleep</button>
           </motion.div>
         )}
 

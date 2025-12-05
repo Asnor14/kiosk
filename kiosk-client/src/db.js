@@ -3,7 +3,7 @@ import Dexie from 'dexie';
 export const db = new Dexie('KioskOfflineDB');
 
 // Define the schema (comma-separated keys to index)
-db.version(6).stores({
+db.version(7).stores({
   // Matches public.students
   students: 'id, student_id, rfid_uid, full_name, enrolled_subjects, face_image_url', 
   
