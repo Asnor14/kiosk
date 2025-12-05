@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.86.0",
+    "dexie": "^4.2.1",
     "face-api.js": "^0.22.2",
     "framer-motion": "^11.18.2",
     "react": "^18.2.0",
