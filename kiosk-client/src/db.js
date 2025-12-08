@@ -2,14 +2,14 @@ import Dexie from 'dexie';
 
 export const db = new Dexie('KioskOfflineDB');
 
-// Define the schema (comma-separated keys to index)
-db.version(9).stores({
-  // Matches public.students
-  students: 'id, student_id, rfid_uid, full_name, enrolled_subjects, face_image_url', 
+// Bump version to 10 to update the schema
+db.version(20).stores({
+  // Added 'descriptor' to cache the face data offline
+  students: 'id, student_id, rfid_uid, full_name, enrolled_subjects, face_image_url, descriptor', 
   
   // Matches public.schedules
   schedules: 'id, subject_code, subject_name, time_start, time_end, days, kiosk_id',
   
-  // Local logs (will be uploaded to public.attendance_logs)
+  // Local logs
   logs: '++local_id, student_id, subject_code, date, sync_status' 
 });

@@ -8,11 +8,12 @@ import { supabase } from './supabaseClient';
 import { db } from './db'; 
 import { 
   FaUserPlus, FaDesktop, FaFingerprint, FaCog,
-  FaArrowLeft, FaCamera, FaPowerOff, FaWifi, FaVideoSlash, FaSignOutAlt, FaIdCard, FaSync, FaCloudUploadAlt, FaDatabase, FaClock
+  FaArrowLeft, FaCamera, FaPowerOff, FaWifi, FaVideoSlash, FaSignOutAlt, 
+  FaIdCard, FaSync, FaCloudUploadAlt, FaDatabase, FaClock, FaCheckCircle, FaUserCheck
 } from 'react-icons/fa';
 import './styles.css';
 
-// Connect to Hardware Server
+// Connect to Hardware Server (Localhost works offline)
 const socket = io('http://localhost:4000');
 
 const generatePorts = () => {
@@ -21,6 +22,9 @@ const generatePorts = () => {
   ports.push('/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM0', '/dev/ttyACM1');
   return ports;
 };
+
+// --- CONFIGURATION ---
+const REQUIRE_FACE_RECOGNITION = true; // Enforce Face Scan before RFID
 
 function App() {
   const [view, setView] = useState('menu'); 
@@ -40,12 +44,15 @@ function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
 
+  // Recognition State
+  const [recognizedUser, setRecognizedUser] = useState(null); // { id: '123', name: 'John' }
+
   // Settings
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [selectedPort, setSelectedPort] = useState('COM6');
   const [portStatus, setPortStatus] = useState('unknown');
   
-  // NEW: Timer State
+  // Timer State
   const [timeLeft, setTimeLeft] = useState(30);
 
   const webcamRef = useRef(null);
@@ -57,9 +64,13 @@ function App() {
     const init = async () => {
       setLoadingText('Starting System...');
       
+      // Load AI Models from local public folder (Works Offline)
       await loadModels();
+      
       await cleanupDailyLogs();
-      await updateLocalStats();
+      
+      // Load Data from Dexie (Works Offline)
+      await updateLocalStats(); 
 
       socket.on('rfid-tag', (uid) => handleRfidScan(uid));
       socket.on('current-config', (config) => setSelectedPort(config.port));
@@ -76,6 +87,7 @@ function App() {
         setLoadingText('');
       }
 
+      // Background Sync Loop
       const syncInterval = setInterval(() => {
         if(navigator.onLine && deviceId) {
           uploadLogs();
@@ -94,16 +106,16 @@ function App() {
     };
   }, []);
 
-  // --- NEW: VISUAL COUNTDOWN TIMER ---
+  // --- VISUAL COUNTDOWN TIMER ---
   useEffect(() => {
     let timer;
     if (view === 'attendance') {
       timer = setInterval(() => {
         setTimeLeft((prev) => {
           if (prev <= 1) {
-            // Time is up! Go to sleep.
-            Swal.close(); // Close any open alerts so they don't stick
+            Swal.close(); 
             setView('idle');
+            setRecognizedUser(null);
             return 30;
           }
           return prev - 1;
@@ -113,7 +125,6 @@ function App() {
     return () => clearInterval(timer);
   }, [view]);
 
-  // Helper to reset timer when activity happens
   const resetActivityTimer = () => {
     setTimeLeft(30);
   };
@@ -124,16 +135,10 @@ function App() {
 
     const channel = supabase.channel('kiosk-realtime')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'schedules' }, 
-        () => {
-          console.log("🔔 Schedules changed. Syncing...");
-          downloadDataToLocal(deviceId);
-        }
+        () => downloadDataToLocal(deviceId)
       )
       .on('postgres_changes', { event: '*', schema: 'public', table: 'students' }, 
-        () => {
-          console.log("🔔 Students changed. Syncing...");
-          downloadDataToLocal(deviceId);
-        }
+        () => downloadDataToLocal(deviceId)
       )
       .subscribe();
 
@@ -148,6 +153,7 @@ function App() {
   };
 
   const updateLocalStats = async () => {
+    // This runs offline. It pulls data from Dexie DB.
     const sCount = await db.students.count();
     const lCount = await db.logs.where('sync_status').equals('pending').count();
     const sch = await db.schedules.toArray();
@@ -155,6 +161,12 @@ function App() {
     setStudentsCount(sCount);
     setPendingUploads(lCount);
     setSchedules(sch);
+
+    // Initialize Face Matcher using local Dexie data
+    const localStudents = await db.students.toArray();
+    if(cameraEnabled && localStudents.length > 0 && !faceMatcher) {
+       await prepareFaceMatcher(localStudents);
+    }
   };
 
   const downloadDataToLocal = async (currentKioskId) => {
@@ -165,17 +177,30 @@ function App() {
       const { data: stdData } = await supabase.from('students').select('*');
       const { data: schData } = await supabase.from('schedules').select('*');
 
+      // CRITICAL: Preserve existing face descriptors so we don't need to re-download images
+      const existingStudents = await db.students.toArray();
+      const descriptorMap = {};
+      existingStudents.forEach(s => {
+         // Map student_id to their calculated face descriptor
+         if(s.descriptor) descriptorMap[s.student_id] = s.descriptor;
+      });
+
+      const mergedStudents = stdData.map(s => ({
+         ...s,
+         // If we have a local descriptor, keep it. Otherwise null.
+         descriptor: (descriptorMap[s.student_id]) ? descriptorMap[s.student_id] : null
+      }));
+
       await db.transaction('rw', db.students, db.schedules, async () => {
         await db.students.clear();
         await db.schedules.clear();
 
-        if (stdData?.length) await db.students.bulkPut(stdData);
+        if (mergedStudents?.length) await db.students.bulkPut(mergedStudents);
         if (schData?.length) await db.schedules.bulkPut(schData);
       });
       
       await updateLocalStats();
-      if (cameraEnabled && stdData) prepareFaceMatcher(stdData);
-      console.log("✅ Dexie Sync Complete");
+      console.log("✅ Sync Complete");
 
     } catch (error) {
       console.error("Sync Down Error:", error);
@@ -185,7 +210,6 @@ function App() {
 
   const uploadLogs = async () => {
     if (!navigator.onLine) return;
-    
     const pendingLogs = await db.logs.where('sync_status').equals('pending').toArray();
     if (pendingLogs.length === 0) return;
 
@@ -207,34 +231,43 @@ function App() {
     }
   };
 
-  // --- 4. ATTENDANCE LOGIC (CONTINUOUS MODE) ---
+  // --- 4. ATTENDANCE LOGIC (WITH ENFORCEMENT) ---
   const processAttendance = async (uid) => {
-    // A. RAPID FIRE PREVENTION
     const nowTs = Date.now();
     const cleanUid = uid.toString().trim();
     if (lastScannedRef.current.uid === cleanUid && (nowTs - lastScannedRef.current.time) < 5000) return;
     lastScannedRef.current = { uid: cleanUid, time: nowTs };
 
-    // ** UX CHANGE: Reset Timer to 30s on scan, Stay on Page **
     resetActivityTimer();
 
-    // B. FIND STUDENT (Direct DB)
+    // B. FIND STUDENT (Offline via Dexie)
     let student = await db.students.where('rfid_uid').equals(cleanUid).first();
     if (!student) {
        student = await db.students.filter(s => s.rfid_uid && s.rfid_uid.toLowerCase() === cleanUid.toLowerCase()).first();
     }
 
     if (!student) {
-      return Swal.fire({ 
-        icon: 'error', 
-        title: 'Not Registered', 
-        text: `UID: ${cleanUid}`, 
-        timer: 2000, 
-        showConfirmButton: false 
-      });
+      return Swal.fire({ icon: 'error', title: 'Not Registered', text: `UID: ${cleanUid}`, timer: 2000, showConfirmButton: false });
     }
 
-    // C. CHECK SCHEDULE (Direct DB)
+    // --- C. FACE RECOGNITION ENFORCEMENT ---
+    if (REQUIRE_FACE_RECOGNITION && cameraEnabled && modelsLoaded) {
+       // Check if the camera currently sees the person who owns this card
+       if (!recognizedUser || recognizedUser.id !== student.student_id) {
+          return Swal.fire({ 
+             icon: 'warning', 
+             title: 'Face Mismatch', 
+             html: `Card: <b>${student.full_name}</b><br>Please look at the camera to verify identity.`, 
+             timer: 3000, 
+             showConfirmButton: false,
+             background: '#1B1B1B', 
+             color: '#FFE7D0'
+          });
+       }
+    }
+    // -----------------------------------------
+
+    // D. CHECK SCHEDULE (Offline via Dexie)
     const now = new Date();
     const hours = String(now.getHours()).padStart(2, '0');
     const minutes = String(now.getMinutes()).padStart(2, '0');
@@ -245,52 +278,28 @@ function App() {
 
     const activeClass = allSchedules.find(s => {
       if (!s.days || !s.days.includes(currentDay)) return false;
-      const start = s.time_start.substring(0, 5);
-      const end = s.time_end.substring(0, 5);
-      return currentTime >= start && currentTime <= end;
+      return currentTime >= s.time_start.substring(0, 5) && currentTime <= s.time_end.substring(0, 5);
     });
 
     if (!activeClass) {
-      return Swal.fire({ 
-        icon: 'warning', 
-        title: 'No Class', 
-        text: `${currentTime} (${currentDay})`, 
-        timer: 2000, 
-        showConfirmButton: false 
-      });
+      return Swal.fire({ icon: 'warning', title: 'No Class', text: `${currentTime} (${currentDay})`, timer: 2000, showConfirmButton: false });
     }
 
-    // D. CHECK ENROLLMENT
+    // E. CHECK ENROLLMENT
     const enrolledArr = student.enrolled_subjects ? student.enrolled_subjects.split(',') : [];
-    const isEnrolled = enrolledArr.some(code => code.trim() === activeClass.subject_code);
-    
-    if (!isEnrolled) {
-      return Swal.fire({ 
-        icon: 'error', 
-        title: 'Not Enrolled', 
-        text: activeClass.subject_name, 
-        timer: 2000, 
-        showConfirmButton: false 
-      });
+    if (!enrolledArr.some(code => code.trim() === activeClass.subject_code)) {
+      return Swal.fire({ icon: 'error', title: 'Not Enrolled', text: activeClass.subject_name, timer: 2000, showConfirmButton: false });
     }
 
-    // E. CHECK DUPLICATE (LOCAL)
+    // F. CHECK DUPLICATE (Offline via Dexie)
     const today = now.toISOString().split('T')[0];
-    const existingLog = await db.logs
-      .where({ student_id: student.student_id, subject_code: activeClass.subject_code, date: today })
-      .first();
+    const existingLog = await db.logs.where({ student_id: student.student_id, subject_code: activeClass.subject_code, date: today }).first();
 
     if (existingLog) {
-       return Swal.fire({ 
-         icon: 'info', 
-         title: 'Already Present', 
-         text: `${student.full_name}`, 
-         timer: 2000, 
-         showConfirmButton: false 
-       });
+       return Swal.fire({ icon: 'info', title: 'Already Present', text: `${student.full_name}`, timer: 2000, showConfirmButton: false });
     }
 
-    // F. SAVE LOG
+    // G. SAVE LOG (Locally first)
     await db.logs.add({
       student_id: student.student_id,
       student_name: student.full_name,
@@ -304,25 +313,18 @@ function App() {
 
     updateLocalStats(); 
 
-    // G. SUCCESS UI (Quick Toast, Continuous Mode)
     Swal.fire({
       icon: 'success',
-      title: 'Present!',
-      html: `
-        <h2 style="color:#FC6E20; font-weight:bold">${student.full_name}</h2>
-        <p style="margin:0">${activeClass.subject_name}</p>
-      `,
+      title: 'Verified & Present!',
+      html: `<h2 style="color:#FC6E20; font-weight:bold">${student.full_name}</h2><p style="margin:0">${activeClass.subject_name}</p>`,
       background: '#1B1B1B', 
       color: '#FFE7D0',
       timer: 2000, 
-      showConfirmButton: false,
-      position: 'center'
+      showConfirmButton: false
     });
 
+    setRecognizedUser(null); // Reset for next person
     if (navigator.onLine) uploadLogs();
-    
-    // ** IMPORTANT: Do NOT call setView('idle') here! **
-    // The timer hook handles the exit if no one else scans.
   };
 
   // --- 5. AUTH & SESSION ---
@@ -347,6 +349,7 @@ function App() {
 
   const verifySession = async (key) => {
     if (!navigator.onLine) {
+        // Offline Session Recovery
         const cachedId = localStorage.getItem('kiosk_id');
         const cachedName = localStorage.getItem('kiosk_name');
         if(cachedId) {
@@ -378,7 +381,6 @@ function App() {
     } else {
       await updateLocalStats();
     }
-    
     setView('idle');
     setLoadingText('');
   };
@@ -397,9 +399,11 @@ function App() {
       }
   };
 
-  // --- 6. HELPERS ---
+  // --- 6. HELPERS & MODEL LOADING ---
   const loadModels = async () => {
-    const MODEL_URL = '/models';
+    // Models are loaded from the /public/models folder on the local device
+    // This allows it to work offline as long as the app assets are loaded
+    const MODEL_URL = '/models'; 
     try {
       await Promise.all([
         faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
@@ -411,21 +415,58 @@ function App() {
     } catch(e) { console.error("Model Error", e); }
   };
   
+  // --- OFFLINE-READY FACE MATCHER ---
   const prepareFaceMatcher = async (studentList) => {
     if (!cameraEnabled || !studentList) return;
-    const labeledDescriptors = await Promise.all(
-      studentList.map(async (student) => {
-        if (!student.face_image_url) return null;
-        try {
-          const img = await faceapi.fetchImage(student.face_image_url);
-          const detections = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
-          if (!detections) return null;
-          return new faceapi.LabeledFaceDescriptors(student.student_id, [detections.descriptor]);
-        } catch { return null; }
-      })
-    );
-    const valid = labeledDescriptors.filter(d => d !== null);
-    if (valid.length > 0) setFaceMatcher(new faceapi.FaceMatcher(valid, 0.6));
+    
+    // Only block UI if we actually have processing to do
+    const needsProcessing = studentList.some(s => s.face_image_url && !s.descriptor);
+    if(needsProcessing) setLoadingText('Training Face AI...');
+    
+    const labeledDescriptors = [];
+    const updatesToDb = []; 
+
+    for (const student of studentList) {
+        if (!student.face_image_url) continue;
+
+        let descriptorFloat32;
+
+        // 1. OFFLINE CHECK: Check if we already have the descriptor in Dexie
+        if (student.descriptor) {
+            // Restore descriptor from local DB (Instant, no internet needed)
+            descriptorFloat32 = new Float32Array(Object.values(student.descriptor));
+        } else {
+            // 2. ONLINE FALLBACK: Fetch image and calculate (Only runs if online)
+            if(navigator.onLine) {
+                try {
+                    const img = await faceapi.fetchImage(student.face_image_url);
+                    const detections = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
+                    
+                    if (detections) {
+                        descriptorFloat32 = detections.descriptor;
+                        // Save to Dexie so next time we can be offline
+                        updatesToDb.push({ key: student.id, changes: { descriptor: descriptorFloat32 } });
+                    }
+                } catch (err) {
+                    console.warn(`Skipping face for ${student.student_id} (Offline or Error)`);
+                }
+            }
+        }
+
+        if (descriptorFloat32) {
+            labeledDescriptors.push(new faceapi.LabeledFaceDescriptors(student.student_id, [descriptorFloat32]));
+        }
+    }
+
+    // Batch update Dexie with any new descriptors calculated
+    if (updatesToDb.length > 0) {
+        await db.students.bulkUpdate(updatesToDb);
+    }
+
+    if (labeledDescriptors.length > 0) {
+        setFaceMatcher(new faceapi.FaceMatcher(labeledDescriptors, 0.6));
+    }
+    setLoadingText('');
   };
 
   const handleRfidScan = (uid) => {
@@ -481,9 +522,9 @@ function App() {
      socket.emit('change-port', e.target.value);
   };
   
-  // ** START ATTENDANCE FLOW **
   const startAttendance = () => {
-     setTimeLeft(30); // Init timer
+     setTimeLeft(30); 
+     setRecognizedUser(null);
      setView('attendance');
      if(navigator.onLine) uploadLogs();
   };
@@ -493,20 +534,37 @@ function App() {
       if (cameraEnabled && webcamRef.current && webcamRef.current.video.readyState === 4 && canvasRef.current) {
         const video = webcamRef.current.video;
         const displaySize = { width: video.videoWidth, height: video.videoHeight };
-        faceapi.matchDimensions(canvasRef.current, displaySize);
+        
+        if(canvasRef.current.width !== displaySize.width) faceapi.matchDimensions(canvasRef.current, displaySize);
+
         const detections = await faceapi.detectAllFaces(video, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks().withFaceDescriptors();
         const resized = faceapi.resizeResults(detections, displaySize);
         canvasRef.current.getContext('2d').clearRect(0, 0, displaySize.width, displaySize.height);
         
-        if (faceMatcher) {
-          const results = resized.map(d => faceMatcher.findBestMatch(d.descriptor));
-          results.forEach((res, i) => {
-            const box = resized[i].detection.box;
-            const match = students.find(s => s.student_id === res.label);
-            const label = match ? match.full_name : "Unknown";
-            const color = match ? '#2ecc71' : '#e74c3c';
-            new faceapi.draw.DrawBox(box, { label, boxColor: color }).draw(canvasRef.current);
-          });
+        if (resized.length === 0) {
+            // No face seen
+        }
+
+        if (faceMatcher && resized.length > 0) {
+          const bestResult = resized[0];
+          const match = faceMatcher.findBestMatch(bestResult.descriptor);
+          const box = bestResult.detection.box;
+          
+          if (match.label !== 'unknown') {
+             // We found a registered student
+             const student = await db.students.where('student_id').equals(match.label).first();
+             const name = student ? student.full_name : match.label;
+             
+             if (!recognizedUser || recognizedUser.id !== match.label) {
+                 setRecognizedUser({ id: match.label, name: name });
+                 resetActivityTimer(); 
+             }
+
+             const drawBox = new faceapi.draw.DrawBox(box, { label: "Verified: Tap Card", boxColor: '#2ecc71' });
+             drawBox.draw(canvasRef.current);
+          } else {
+             new faceapi.draw.DrawBox(box, { label: "Unknown", boxColor: '#e74c3c' }).draw(canvasRef.current);
+          }
         }
       }
     }, 200);
@@ -519,7 +577,7 @@ function App() {
       
       {isSyncing && (
          <div className="fixed top-4 left-4 bg-brand-orange text-white px-4 py-2 rounded-full z-50 flex items-center gap-2 shadow-lg animate-pulse">
-            <FaSync className="animate-spin"/> Updating...
+            <FaSync className="animate-spin"/> Updating Data...
          </div>
       )}
 
@@ -549,7 +607,7 @@ function App() {
                 <div className="flex justify-between border-b border-white/10 py-1"><span>Cached Students:</span><span className="font-mono">{studentsCount}</span></div>
                 <div className="flex justify-between border-b border-white/10 py-1"><span>Cached Schedules:</span><span className="font-mono">{schedules.length}</span></div>
                 <div className="flex justify-between pt-1"><span>Logs to Upload:</span><span className="font-mono text-yellow-400">{pendingUploads}</span></div>
-                <button onClick={() => downloadDataToLocal(deviceId)} className="mt-3 bg-brand-charcoal hover:bg-gray-700 w-full py-2 rounded text-xs">Force Re-Sync</button>
+                <button onClick={() => downloadDataToLocal(deviceId)} className="mt-3 bg-brand-charcoal hover:bg-gray-700 w-full py-2 rounded text-xs">Force Re-Sync & Retrain</button>
              </div>
              <div className="input-group">
                <label className="input-label">Serial Port</label>
@@ -598,7 +656,6 @@ function App() {
 
         {view === 'attendance' && (
           <motion.div key="att" className="camera-view">
-             {/* VISUAL TIMER BADGE */}
              <div className="timer-badge">
                 <FaClock/> Closing in {timeLeft}s
              </div>
@@ -606,9 +663,17 @@ function App() {
              <div className="camera-wrapper">
                 {cameraEnabled && modelsLoaded ? (
                    <>
-                    <Webcam audio={false} ref={webcamRef} className="webcam" onUserMedia={handleVideoOnPlay}/>
+                    <Webcam audio={false} ref={webcamRef} className="webcam" onUserMedia={handleVideoOnPlay} mirrored={true} />
                     <canvas ref={canvasRef} className="canvas-overlay"/>
-                    <div className="overlay-message"><div className="badge"><FaCamera/> Face Scan Active</div></div>
+                    <div className="overlay-message">
+                        {recognizedUser ? (
+                            <div className="badge success-badge" style={{background:'rgba(46,204,113,0.9)', border:'1px solid #27ae60'}}>
+                                <FaUserCheck/> Hello, {recognizedUser.name.split(' ')[0]}!<br/><span style={{fontSize:'0.8em'}}>Please Tap Card</span>
+                            </div>
+                        ) : (
+                            <div className="badge"><FaCamera/> Look at Camera</div>
+                        )}
+                    </div>
                    </>
                 ) : (
                    <div className="camera-off">
