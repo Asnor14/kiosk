@@ -49,7 +49,7 @@ function App() {
 
   // Settings
   const [cameraEnabled, setCameraEnabled] = useState(true);
-  const [selectedPort, setSelectedPort] = useState('COM6');
+  const [selectedPort, setSelectedPort] = useState('COM5');
   const [portStatus, setPortStatus] = useState('unknown');
   
   // Timer State

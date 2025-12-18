@@ -16,7 +16,7 @@ const io = new Server(server, {
 
 // --- DYNAMIC SERIAL PORT CONFIGURATION ---
 let port = null;
-let currentPortPath = process.env.SERIAL_PORT || 'COM6'; // Default
+let currentPortPath = process.env.SERIAL_PORT || 'COM5'; // Default
 
 const connectToPort = (path) => {
   // 1. Close existing if open
